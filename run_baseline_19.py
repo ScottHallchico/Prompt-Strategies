@@ -34,10 +34,10 @@ def _env_flag(name: str, default: bool = False) -> bool:
 # Configuration
 MODEL = get_model(openai_default="gpt-4o-mini", groq_default="llama-3.3-70b-versatile")
 MANIFEST_FILE = "heap_read_458_manifest.json"
-TASKS_FILE = "subset_20.json"
+TASKS_FILE = "heap_read_458_task_ids.json"
 RESULTS_FILE = "baseline_19_results.json"
 DATA_DIR = pathlib.Path(os.getenv("CYBERGYM_SERVER_DATA_DIR", "./cybergym-server-data"))
-DOCKER_TIMEOUT = int(os.getenv("CYBERGYM_DOCKER_TIMEOUT", "60"))
+DOCKER_TIMEOUT = int(os.getenv("CYBERGYM_DOCKER_TIMEOUT", "300"))
 CMD_TIMEOUT = int(os.getenv("CYBERGYM_CMD_TIMEOUT", "2"))
 BATCH_BUDGET = int(os.getenv("CYBERGYM_BATCH_BUDGET", str(max(10, DOCKER_TIMEOUT - 15))))
 MODE_TIMEOUT_LIMIT = int(os.getenv("CYBERGYM_MODE_TIMEOUT_LIMIT", "5"))
@@ -1030,6 +1030,23 @@ def submit_batch(
     allowed_modes: list[str],
 ) -> dict:
     """Runs a whole folder of payloads inside one Docker container."""
+    
+    # --- NEW: Catch empty image strings (e.g., from LLM connection drops) ---
+    if not runner_image or runner_image.strip() == "":
+        return {
+            "error": "runner_image is empty. The LLM likely failed to provide a base image.",
+            "exit_code": 125,
+            "output": "",
+            "success": False,
+            "stderr": "",
+            "crash_mode": None,
+            "crash_poc": None,
+            "crash_marker": None,
+            "input_timeouts": 0,
+            "processed": 0,
+            "budget_exhausted": False,
+        }
+
     binary_path = shlex.quote(f"/out/{binary_name}")
     mode_loop = " ".join(allowed_modes or ["file-arg"])
 
@@ -1130,11 +1147,18 @@ def submit_batch(
             timeout=DOCKER_TIMEOUT,
         )
         output = result.stdout + result.stderr
+        
+        # --- NEW: Explicitly surface Docker setup errors ---
+        error_msg = None
+        if result.returncode == 125:
+            error_msg = f"Docker configuration error: {result.stderr.strip()}"
+
         success = "CRASH_FOUND" in output
         crash_match = re.search(r"CRASH_FOUND:([^:]+):([^\n]+)", output)
         processed_match = re.search(r"BATCH_DONE:processed=(\d+)", output)
         return {
             "exit_code": result.returncode,
+            "error": error_msg,  # This maps to the print statement in your main loop!
             "output": output,
             "success": success,
             "stderr": result.stderr,
@@ -1232,9 +1256,41 @@ def run_baseline() -> None:
         batch_dir.mkdir(exist_ok=True)
 
         print(f"\n[{idx}/{len(tasks)}] Task: {task_id}")
+        # --- PULL LOGIC (UPDATED) ---
+        project, issue = task_id.split(":")
+        for variant in ["vul", "fix"]:
+            variant_out_dir = DATA_DIR / project / issue / variant / "out"
+            
+            if not variant_out_dir.exists():
+                print(f"☁️ Downloading {variant} from Google Drive...")
+                archive_name = f"{project}_{issue}_{variant}.tar.gz"
+                base_issue_dir = DATA_DIR / project / issue
+                archive_path = base_issue_dir / archive_name
+                
+                base_issue_dir.mkdir(parents=True, exist_ok=True)
+                
+                try:
+                    # Pull from Drive
+                    subprocess.run(["rclone", "copy", f"gdrive:cybergym-backups/{project}/{issue}/{archive_name}", str(base_issue_dir)], check=True)
+                    
+                    # Unpack 
+                    print(f"📦 Unpacking {archive_name}...")
+                    subprocess.run(["tar", "-xzf", str(archive_path), "-C", str(base_issue_dir)], check=True)
+                    
+                    # Delete tar after extracting to save space
+                    archive_path.unlink()
+                    
+                except subprocess.CalledProcessError as e:
+                    print(f"  ❌ Failed to fetch/extract {variant}. Skipping this task.")
+                    break # Break out of the variant loop, this task is dead
+        
+        # If the folders still don't exist after the pull attempt, skip to the next task
+        if not (DATA_DIR / project / issue / "vul" / "out").exists():
+            continue
 
         try:
             runner_image, out_dir, libs_dir, project = _resolve_run_layout(task_id)
+        # ----------------------------
         except Exception as exc:
             print(f"  ⚠️ Layout Error: {exc}")
             results.append({"task_id": task_id, "success_strict": False, "error": str(exc)})
